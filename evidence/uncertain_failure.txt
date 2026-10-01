@@ -1,0 +1,6 @@
+2026-10-01T09:14:02Z INFO  checkout service listening on :8080
+2026-10-01T09:14:09Z INFO  POST /reserve accepted sku=SKU-7 qty=3
+2026-10-01T09:14:09Z WARN  reservation retry 1 for sku=SKU-7
+2026-10-01T09:14:11Z ERROR POST /reserve failed status=500
+2026-10-01T09:14:11Z ERROR request_id=8f2c1a trace_id=tr-9910 upstream=pricing
+2026-10-01T09:14:11Z ERROR no further detail recorded for request_id=8f2c1a

@@ -1,0 +1,17 @@
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# safi-rca scratch space (git archive exports of analysed commits)
+.tmp/
+safi-rca-tmp/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

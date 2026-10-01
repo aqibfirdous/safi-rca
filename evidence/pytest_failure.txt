@@ -1,0 +1,36 @@
+F.....                                                                   [100%]
+================================== FAILURES ===================================
+_____________________ test_gold_customer_charge_succeeds ______________________
+
+    def test_gold_customer_charge_succeeds():
+        request = {"customer_id": "cust-1002", "amount": Decimal("100.00")}
+>       status, body = handle_post_charge(request)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\payment\test_gold_tier.py:10: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src\api\http_server.py:22: in handle_post_charge
+    discounted = _VALIDATOR.validate(amount, customer)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <payment.validator.PaymentValidator object at 0x00000205660E0D70>
+amount = Decimal('100.00')
+customer = {'id': 'cust-1002', 'name': 'Bilal', 'tier': 'gold'}
+
+    def validate(self, amount, customer):
+        """Return the amount after the customer's tier discount is applied.
+    
+        Raises :class:`ValidationError` when the amount is invalid.
+        """
+        self._check_amount(amount)
+    
+        plan = self._lookup_plan(customer["tier"])
+>       rate = plan["rate"]
+               ^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+src\payment\validator.py:32: TypeError
+=========================== short test summary info ===========================
+FAILED tests/payment/test_gold_tier.py::test_gold_customer_charge_succeeds - ...
+1 failed, 5 passed in 0.20s

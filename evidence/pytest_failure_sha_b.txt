@@ -1,0 +1,19 @@
+F.....                                                                   [100%]
+================================== FAILURES ===================================
+_____________________ test_gold_customer_charge_succeeds ______________________
+
+    def test_gold_customer_charge_succeeds():
+        request = {"customer_id": "cust-1002", "amount": Decimal("100.00")}
+        status, body = handle_post_charge(request)
+        assert status == 200
+>       assert body["amount"] == "100.00"
+E       AssertionError: assert '100.0000' == '100.00'
+E         
+E         - 100.00
+E         + 100.0000
+E         ?       ++
+
+tests\payment\test_gold_tier.py:12: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/payment/test_gold_tier.py::test_gold_customer_charge_succeeds - ...
+1 failed, 5 passed in 0.14s

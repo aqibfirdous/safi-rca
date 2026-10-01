@@ -1,0 +1,6 @@
+[submodule "fixtures/sample-repo"]
+	path = fixtures/sample-repo
+	url = ./fixtures/origin/sample-repo.git
+[submodule "fixtures/alt-repo"]
+	path = fixtures/alt-repo
+	url = ./fixtures/origin/alt-repo.git
