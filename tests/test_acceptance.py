@@ -383,6 +383,67 @@ def test_parsed_report_carries_real_provenance(broken_report):
     assert report.repo == "sample-repo"
 
 
+def test_model_reply_json_survives_the_shapes_models_actually_emit():
+    """Extract the report from replies that are valid in intent, not in bytes.
+
+    Every case here was produced by a live model.  Each one used to fail the
+    whole run with `RuntimeUnavailable`, discarding a report the model had
+    reasoned correctly.
+    """
+    from safi_rca.errors import RuntimeUnavailable
+    from safi_rca.runtime.openhands_runtime import _extract_json_object
+
+    report = {"root_cause": "missing fallback", "confidence": "High"}
+
+    # 1. Fenced, the way the model is asked to answer.
+    assert _extract_json_object(f"Here you go:\n```json\n{json.dumps(report)}\n```") == report
+
+    # 2. A literal newline inside a JSON string.  Invalid strict JSON, but the
+    #    intent is unambiguous, so it is accepted rather than thrown away.
+    wrapped = '{"root_cause": "missing\nfallback", "confidence": "High"}'
+    assert _extract_json_object(wrapped)["root_cause"] == "missing\nfallback"
+
+    # 3. Prose containing a brace *before* the report.  A greedy `\\{.*\\}` starts
+    #    on the prose brace and fails to parse.
+    chatty = "I considered the set {standard, gold} first.\n" + json.dumps(report)
+    assert _extract_json_object(chatty) == report
+
+    # 4. A second object after the report must not be swallowed.
+    trailing = json.dumps(report) + '\n{"debug": {"tokens": 1}}'
+    assert _extract_json_object(trailing) == report
+
+    # Genuinely unusable replies still fail loudly rather than yielding {}.
+    for bad in ("", "no json here at all", "[1, 2, 3]"):
+        with pytest.raises(RuntimeUnavailable):
+            _extract_json_object(bad)
+
+
+def test_markdown_reply_triggers_a_reformat_retry_not_a_failed_run():
+    """A correct analysis in the wrong shape must be re-asked, not thrown away.
+
+    A live model spotted that a traceback could not occur at the analysed sha and
+    then answered in Markdown headings.  The substance was right; only the format
+    was wrong, so the agent is asked to restate it instead of the run failing.
+    """
+    from safi_rca.runtime.openhands_runtime import (
+        RETRY_INSTRUCTION,
+        _looks_like_report,
+    )
+
+    markdown = (
+        "### Root Cause\nThe traceback cannot occur at this sha because "
+        "`_lookup_plan` always resolves a value.\n\n### Confidence\nLow"
+    )
+    assert _looks_like_report(markdown) is False, "a prose reply must be re-asked"
+
+    good = '{"root_cause": "cannot occur here", "confidence": "Low"}'
+    assert _looks_like_report(good) is True
+
+    # The retry must tell the model to keep its conclusion, not to re-derive one.
+    assert "keep your conclusion" in RETRY_INSTRUCTION.lower()
+    assert "bare json" in RETRY_INSTRUCTION.lower()
+
+
 @contextmanager
 def _exported_tree(repo: Path, sha: str):
     """Export `sha` to a scratch dir, with no checkout of the user's repo."""

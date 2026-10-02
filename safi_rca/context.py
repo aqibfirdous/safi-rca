@@ -115,11 +115,22 @@ class AnalysisContext:
             parts.append("")
         parts.append("## REQUIRED OUTPUT")
         parts.append(
-            "Reply with a single JSON object with keys: symptom, root_cause, "
-            "affected_component, reasoning_summary, evidence (list of "
-            "{kind, statement, file, line, symbol, quote}), confidence, uncertainty, "
-            "recommended_next_action. Root cause must be a defect in this code at this "
-            "sha, not the visible error. Every claim needs file/line evidence."
+            "Reply with ONE JSON object and nothing else. No prose before or after it, no "
+            "Markdown headings, no code fence. The first character of your reply must be "
+            "{ and the last must be }."
+        )
+        parts.append("")
+        parts.append("Keys: symptom, root_cause, affected_component, reasoning_summary,")
+        parts.append("evidence (list of {kind, statement, file, line, symbol, quote}),")
+        parts.append("confidence, uncertainty, recommended_next_action.")
+        parts.append("")
+        parts.append(
+            "Rules: the root cause must be a defect in this code at this sha, not the visible "
+            "error. Every claim needs file/line evidence. If the supplied evidence cannot "
+            "occur at this sha, say so in root_cause and set confidence to Low rather than "
+            "inventing a defect. If the evidence is insufficient to name a cause, say that "
+            "instead. Quote source lines verbatim; never invent a literal that is not in "
+            "the snippets above."
         )
         return "\n".join(parts)
 

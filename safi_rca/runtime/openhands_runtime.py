@@ -55,6 +55,7 @@ READ_ONLY_TOOLS = ("ThinkTool", "FinishTool")
 FINISH_TOOL = "FinishTool"
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 LLM_ENV_KEYS = (
     "LLM_API_KEY",
@@ -216,8 +217,28 @@ def build_read_only_agent(backend: _Backend, model: str, api_key: str):
     return agent
 
 
+#: Sent when the agent reasoned well but ignored the output contract.  Observed
+#: against a live model that had correctly spotted that the traceback could not
+#: occur at the analysed sha, then answered in Markdown headings and so threw
+#: away a good diagnosis on a formatting technicality.
+RETRY_INSTRUCTION = (
+    "Your analysis was not in the required format. Keep your conclusion exactly as it "
+    "is, including its confidence and uncertainty, and restate it as ONE JSON object "
+    "and nothing else. No prose, no Markdown headings, no code fence: reply with the "
+    "bare JSON object starting with {{ and ending with }}. Keys: symptom, root_cause, "
+    "affected_component, reasoning_summary, evidence (list of {kind, statement, file, "
+    "line, symbol, quote}), confidence, uncertainty, recommended_next_action."
+)
+
+
 def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str) -> str:
-    """Run one read-only conversation and return the agent's final text."""
+    """Run one read-only conversation and return the agent's final text.
+
+    If the reply cannot be read as the required JSON report, the agent is asked
+    once more to restate the same analysis in the required shape.  That keeps a
+    correct diagnosis that merely ignored the format, instead of reporting a
+    runtime failure.
+    """
 
     workspace = backend.sdk.LocalWorkspace(working_dir=str(workspace_dir))
     conversation = backend.sdk.LocalConversation(
@@ -228,6 +249,11 @@ def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str)
     try:
         conversation.send_message(prompt)
         conversation.run()
+        reply = _final_agent_text(conversation)
+        if _looks_like_report(reply):
+            return reply
+        conversation.send_message(RETRY_INSTRUCTION)
+        conversation.run()
         return _final_agent_text(conversation)
     finally:
         close = getattr(conversation, "close", None)
@@ -236,6 +262,16 @@ def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str)
                 close()
             except Exception:  # noqa: BLE001 - teardown must not mask the result
                 pass
+
+
+def _looks_like_report(reply: str) -> bool:
+    """True when the reply already contains a parseable report object."""
+
+    try:
+        _extract_json_object(reply)
+    except RuntimeUnavailable:
+        return False
+    return True
 
 
 def _final_agent_text(conversation) -> str:
@@ -360,14 +396,92 @@ def _run_core_agent(backend: _Backend, prompt: str, model: str, key: str) -> str
     return getattr(result, "content", str(result))
 
 
+def _extract_json_object(reply: str) -> dict:
+    """Pull the report object out of a model reply.
+
+    Three separate failure modes are handled, all of them observed against a
+    live model:
+
+    * the reply wraps the report in prose or a ```` ```json ```` fence, so a
+      greedy ``\\{.*\\}`` can start on a brace that belongs to the prose;
+    * the reply contains a *second* ``{...}`` after the report, which a greedy
+      match swallows; and
+    * the model writes a literal newline inside a JSON string, which is invalid
+      strict JSON but is exactly what it means, so ``strict=False`` is used.
+    """
+
+    text = reply or ""
+    fenced = _JSON_FENCE.search(text)
+    if fenced:
+        text = fenced.group(1)
+
+    candidates = _balanced_objects(text)
+    if not candidates:
+        # Last resort: the original greedy match, in case of unusual nesting.
+        greedy = _JSON_BLOCK.search(text)
+        if greedy is None:
+            raise RuntimeUnavailable("OpenHands reply contained no JSON report block")
+        candidates = [greedy.group(0)]
+
+    parsed: list[dict] = []
+    first_error: json.JSONDecodeError | None = None
+    for block in candidates:
+        try:
+            value = json.loads(block, strict=False)
+        except json.JSONDecodeError as exc:
+            first_error = first_error or exc
+            continue
+        if isinstance(value, dict):
+            parsed.append(value)
+
+    if not parsed:
+        raise RuntimeUnavailable(f"OpenHands reply was not valid JSON: {first_error}")
+    # Prose braces parse as nothing, so anything that reached here is a real
+    # object.  Prefer one that looks like the report; otherwise take the biggest.
+    for value in parsed:
+        if "root_cause" in value:
+            return value
+    return max(parsed, key=len)
+
+
+def _balanced_objects(text: str) -> list[str]:
+    """Every brace-balanced ``{...}`` in order, ignoring braces inside strings."""
+
+    found: list[str] = []
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        closed = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    found.append(text[start : index + 1])
+                    closed = True
+                    break
+        if not closed:
+            return found
+        start = text.find("{", start + 1)
+    return found
+
+
 def _parse_report(reply: str, ctx: AnalysisContext) -> RcaReport:
-    match = _JSON_BLOCK.search(reply or "")
-    if not match:
-        raise RuntimeUnavailable("OpenHands reply contained no JSON report block")
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        raise RuntimeUnavailable(f"OpenHands reply was not valid JSON: {exc}") from exc
+    data = _extract_json_object(reply)
 
     report = report_from_dict(data)
     # The report always refers to the sha that was analysed, never to a branch.
