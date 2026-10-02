@@ -140,10 +140,43 @@ def _resolve_backend() -> _Backend:
     raise RuntimeUnavailable("; ".join(errors) or "no OpenHands agent entry point found")
 
 
-def _credentials() -> tuple[str, str]:
+def key_for_model(model: str) -> str | None:
+    """The credential env var that belongs to ``model``, if one is implied.
+
+    A model name carries its provider as a litellm prefix, so
+    ``openrouter/anthropic/claude-sonnet-4.5`` is unambiguous about which key it
+    needs even when several are configured.
+    """
+
+    if not model:
+        return None
+    if model.startswith("openrouter/"):
+        return "OPENROUTER_API_KEY"
+    if model.startswith("anthropic/"):
+        return "ANTHROPIC_API_KEY"
+    if model.startswith("gemini/") or model.startswith("vertex_ai/"):
+        return "GEMINI_API_KEY"
+    if model.startswith("openai/") or "/" not in model:
+        # OpenAI models carry no prefix; an unqualified name is assumed OpenAI,
+        # matching KEY_PROVIDER_PREFIX.
+        return "OPENAI_API_KEY"
+    return None
+
+
+def _credentials(model: str = "") -> tuple[str, str]:
     from ..dotenv import load_dotenv  # noqa: PLC0415 - optional, and never overrides a real env var
 
     load_dotenv()
+    # Prefer the provider the requested model actually names.  Falling straight
+    # through LLM_ENV_KEYS order meant that with GEMINI_API_KEY and
+    # OPENROUTER_API_KEY both set, asking for an openrouter/ model silently
+    # picked the Gemini key, so changing LLM_MODEL alone could not switch
+    # provider and failed with an opaque auth error.
+    wanted = key_for_model(model)
+    if wanted:
+        value = os.environ.get(wanted)
+        if value:
+            return wanted, value
     for key in LLM_ENV_KEYS:
         value = os.environ.get(key)
         if value:
@@ -184,6 +217,59 @@ def credential_mismatch(key: str, model: str) -> str | None:
 #: before surfacing an error the operator cannot act on.  Bounded low, the run
 #: fails fast with a readable reason and the user can switch model or wait.
 RETRY_MAX_WAIT_SECONDS = 8.0
+
+#: Ceiling on the model's reply length.  OpenRouter pre-authorises against
+#: ``max_tokens`` before the call, and the SDK's default of 64000 is ~30x more
+#: than this task can use -- the reply is one JSON report of a few thousand
+#: tokens.  On a $15/Mtok output model that pre-authorisation alone asks for
+#: ~$1, which a low balance rejects outright before any tokens are spent.
+#: Override with SAFI_RCA_MAX_OUTPUT_TOKENS.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+#: A provider rejecting the request for lack of funds, e.g.
+#: "This request requires more credits, or fewer max_tokens."
+_CREDIT_MARKERS = (
+    "requires more credits",
+    "insufficient credits",
+    "insufficient_quota",
+    "insufficient funds",
+    "payment required",
+)
+
+
+def max_output_tokens() -> int:
+    """The reply-length ceiling, overridable from the environment."""
+
+    raw = os.environ.get("SAFI_RCA_MAX_OUTPUT_TOKENS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def credits_exhausted(exc: BaseException) -> bool:
+    """True when the provider refused the call for lack of credit.
+
+    Distinct from a rate-limit quota: the key works, the account is out of
+    money, and no amount of retrying or waiting within the window helps.
+    """
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "ratelimit" in text or "429" in text:
+        return False
+    return any(marker in text for marker in _CREDIT_MARKERS)
+
+
+def credits_message(exc: BaseException, model: str = "") -> str:
+    """A short, actionable description of a credit rejection."""
+
+    which = f" for {model}" if model else ""
+    return (
+        f"provider account has insufficient credit{which}. The request was "
+        f"rejected before any tokens were used. Top up the provider balance, "
+        f"or lower SAFI_RCA_MAX_OUTPUT_TOKENS (currently "
+        f"{max_output_tokens()}) so the provider pre-authorises less, or pick a "
+        f"cheaper model, or run the 'local' runtime which needs no account."
+    )
 
 #: A daily free-tier quota rejection, e.g.
 #: "Quota exceeded for metric: ...generate_content_free_tier_requests, limit: 20"
@@ -247,6 +333,7 @@ def build_read_only_agent(backend: _Backend, model: str, api_key: str):
             model=model,
             api_key=api_key,
             retry_max_wait=RETRY_MAX_WAIT_SECONDS,
+            max_output_tokens=max_output_tokens(),
         ),
         tools=[],
         enable_switch_llm_tool=False,
@@ -327,6 +414,8 @@ def _guarded_run(conversation, message: str) -> None:
         conversation.send_message(message)
         conversation.run()
     except Exception as exc:  # noqa: BLE001 - re-raised below when actionable
+        if credits_exhausted(exc):
+            raise RuntimeUnavailable(credits_message(exc)) from exc
         if quota_exhausted(exc):
             raise RuntimeUnavailable(quota_message(exc)) from exc
         raise
@@ -415,7 +504,7 @@ class OpenHandsRuntime:
             backend = _resolve_backend()
         except RuntimeUnavailable as exc:
             return False, str(exc)
-        key, _value = _credentials()
+        key, _value = _credentials(self.model)
         if not key:
             return False, f"openhands present ({backend.label}) but no model credentials; set one of {LLM_ENV_KEYS}"
         detail = f"openhands {backend.label} with credentials from {key}, model {self.model!r}, read-only tools {READ_ONLY_TOOLS}"
@@ -431,7 +520,7 @@ class OpenHandsRuntime:
             raise RuntimeUnavailable(f"OpenHands runtime requested but unusable: {reason}")
 
         backend = _resolve_backend()
-        key, _value = _credentials()
+        key, _value = _credentials(self.model)
         prompt = ctx.render_prompt() + "\n\n" + READ_ONLY_INSTRUCTION.format(sha=ctx.sha)
 
         if backend.is_legacy_core():  # pragma: no cover - classic core layout
