@@ -71,6 +71,24 @@ def _aider_version() -> str:
         return "unavailable"
 
 
+def _close_aider_cache(repo_map) -> None:
+    """Release Aider's tags cache.
+
+    Aider keeps the RepoMap in a ``diskcache.Cache``, i.e. an open SQLite handle.
+    Leaving it open holds a file lock on Windows, which makes the export
+    directory undeletable -- so a run would fail during its own cleanup rather
+    than at the point of the mistake.
+    """
+
+    cache = getattr(repo_map, "TAGS_CACHE", None)
+    close = getattr(cache, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - closing a cache must never fail a run
+            pass
+
+
 def build_with_aider(export_root: Path, files: list[str], map_tokens: int) -> RepoMapResult:
     from . import openai_compat, tree_sitter_compat  # noqa: PLC0415
 
@@ -83,7 +101,10 @@ def build_with_aider(export_root: Path, files: list[str], map_tokens: int) -> Re
 
     ranked = [str(export_root / rel) for rel in files if _eligible(export_root, rel)]
     repo_map = RepoMap(map_tokens=map_tokens, root=str(export_root), io=InputOutput(), verbose=False)
-    text = repo_map.get_repo_map(chat_files=[], other_files=ranked) or ""
+    try:
+        text = repo_map.get_repo_map(chat_files=[], other_files=ranked) or ""
+    finally:
+        _close_aider_cache(repo_map)
     headers = {line.rstrip().split(":")[0] for line in text.splitlines() if line.rstrip().endswith(":")}
     mapped = min(len(headers), len(ranked))
     return RepoMapResult(

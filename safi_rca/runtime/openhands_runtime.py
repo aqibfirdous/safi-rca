@@ -51,9 +51,20 @@ READ_ONLY_INSTRUCTION = (
 #: modify the analysed tree.
 READ_ONLY_TOOLS = ("ThinkTool", "FinishTool")
 
+#: The tool the agent calls to hand back its answer.
+FINISH_TOOL = "FinishTool"
+
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
-LLM_ENV_KEYS = ("LLM_API_KEY", "SAFI_RCA_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
+LLM_ENV_KEYS = (
+    "LLM_API_KEY",
+    "SAFI_RCA_LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "LITELLM_API_KEY",
+)
 
 DEFAULT_MODEL = "anthropic/claude-sonnet-4-5"
 
@@ -84,10 +95,12 @@ def _resolve_backend() -> _Backend:
     """Find the OpenHands agent entry points, without depending on internals."""
     errors: list[str] = []
 
-    # The SDK prints an ASCII banner on import.  It goes to stdout and would
-    # corrupt `safi-rca --json` and the `runtimes` report, so it is suppressed
-    # before the first import.
-    os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
+    # The SDK prints an ASCII banner to stderr on import.  safi-rca's stdout and
+    # JSON output are a contract, so it is suppressed.  The check is normalised
+    # because a value such as "1 " (which is what cmd.exe's `set X=1 & cmd`
+    # produces) would otherwise fail the SDK's exact string comparison.
+    if os.environ.get("OPENHANDS_SUPPRESS_BANNER", "").strip().lower() not in {"1", "true", "yes"}:
+        os.environ["OPENHANDS_SUPPRESS_BANNER"] = "1"
 
     try:
         sdk = _import_optional("openhands.sdk")
@@ -134,22 +147,73 @@ def _credentials() -> tuple[str, str]:
     return "", ""
 
 
+#: Credential env var -> the model prefix litellm routes that key to.  A key from
+#: one provider sent to another produces an opaque auth error deep inside
+#: litellm, so the mismatch is reported up front instead.
+KEY_PROVIDER_PREFIX = {
+    "OPENROUTER_API_KEY": "openrouter/",
+    "ANTHROPIC_API_KEY": "anthropic/",
+    "OPENAI_API_KEY": None,  # OpenAI models carry no prefix
+    "GEMINI_API_KEY": "gemini/",
+}
+
+
+def credential_mismatch(key: str, model: str) -> str | None:
+    """Warn when a credential will be sent to a provider it is not for."""
+    if key not in KEY_PROVIDER_PREFIX:
+        return None
+    expected = KEY_PROVIDER_PREFIX[key]
+    if expected is None:
+        return None if "/" not in model else f"{key} is an OpenAI key but {model!r} names another provider"
+    if model.startswith(expected):
+        return None
+    return (
+        f"{key} is a {expected.rstrip('/')} key but the model is {model!r}; "
+        f"set LLM_MODEL={expected}<provider>/<model>, otherwise litellm sends the key "
+        f"to the wrong provider and fails with an opaque auth error"
+    )
+
+
+def granted_tool_names(agent) -> set[str]:
+    """Every tool the agent can actually call, explicit specs plus defaults."""
+    explicit = {getattr(spec, "name", str(spec)) for spec in (agent.tools or [])}
+    return explicit | set(getattr(agent, "include_default_tools", None) or [])
+
+
 def build_read_only_agent(backend: _Backend, model: str, api_key: str):
     """Construct an OpenHands agent that has no way to write anything.
 
-    ``tools`` is an explicit list rather than ``None``: the SDK treats ``None``
-    as "the canonical default set", and we want the narrower, explicitly bare
-    agent.  ``FinishTool`` is the agent's own answer channel and ``ThinkTool``
-    lets it reason before committing to that answer.
+    ``tools=[]`` is deliberate and is the whole trick.  ``create_agent`` always
+    injects ``BUILT_IN_TOOLS`` via ``include_default_tools``, and in SDK 1.50
+    those are exactly ``FinishTool`` and ``ThinkTool``.  Naming them in ``tools``
+    as well would load each one twice and the agent would refuse to start with
+    ``Duplicate tool names found``.  So we ask for no tools of our own, switch
+    the model-switching tool off, and then *verify* the resulting tool set is
+    exactly the read-only allowlist -- so a future SDK that adds a shell or file
+    -write tool to its defaults fails loudly instead of quietly granting write
+    access to a repository under analysis.
     """
 
-    tools = [backend.tool_cls(name=name) for name in READ_ONLY_TOOLS]
     settings = backend.settings_cls(
         llm=backend.llm_cls(model=model, api_key=api_key),
-        tools=tools,
+        tools=[],
         enable_switch_llm_tool=False,
     )
-    return settings.create_agent()
+    agent = settings.create_agent()
+
+    granted = granted_tool_names(agent)
+    unexpected = granted - set(READ_ONLY_TOOLS)
+    if unexpected:
+        raise RuntimeUnavailable(
+            f"refusing to run: the OpenHands agent would be granted non read-only "
+            f"tools {sorted(unexpected)}; expected only {list(READ_ONLY_TOOLS)}"
+        )
+    missing = set(READ_ONLY_TOOLS) - granted
+    if missing:
+        raise RuntimeUnavailable(
+            f"refusing to run: the OpenHands agent is missing expected tools {sorted(missing)}"
+        )
+    return agent
 
 
 def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str) -> str:
@@ -175,29 +239,63 @@ def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str)
 
 
 def _final_agent_text(conversation) -> str:
-    """Return the text of the last assistant message in the event log."""
+    """Return the agent's final answer from the conversation event log.
+
+    The reply arrives in one of two shapes and which one appears is the model's
+    choice, so both are handled:
+
+    * a :class:`MessageEvent` whose ``source`` is ``agent``, with the text in
+      ``extended_content`` or the underlying ``llm_message``; or
+    * an :class:`ActionEvent` carrying a ``message`` -- the ``finish`` tool's
+      answer channel, whose action deliberately renders an empty observation.
+
+    The action form wins when both are present, since it is the terminal answer.
+    """
 
     from openhands.sdk.event import MessageEvent  # noqa: PLC0415
-    from openhands.sdk.llm import content_to_str  # noqa: PLC0415
+    from openhands.sdk.llm import TextContent  # noqa: PLC0415
 
     try:
         events = list(conversation.state.events)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeUnavailable(f"cannot read OpenHands conversation state: {exc}") from exc
 
-    text = ""
+    action_text = ""
+    message_text = ""
     for event in events:
+        action = getattr(event, "action", None)
+        if action is not None:
+            message = getattr(action, "message", None)
+            if isinstance(message, str) and message.strip():
+                action_text = message
+            continue
+
         if not isinstance(event, MessageEvent) or getattr(event, "source", None) != "agent":
             continue
-        chunks = getattr(event, "extended_content", None)
-        rendered = content_to_str(chunks) if chunks else ""
+
+        # `content_to_str` is a display helper: it returns a list and substitutes
+        # `[Image: N URLs]` for non-text parts.  Reading the text parts directly
+        # keeps an image placeholder out of the report we are about to parse.
+        llm_message = getattr(event, "llm_message", None)
+        parts = []
+        for chunk in getattr(event, "extended_content", None) or getattr(
+            llm_message, "content", None
+        ) or []:
+            if isinstance(chunk, TextContent):
+                parts.append(chunk.text)
+        rendered = "\n".join(parts)
         if not rendered.strip():
-            rendered = content_to_str(getattr(event.llm_message, "content", None) or [])
+            rendered = getattr(llm_message, "reasoning_content", None) or ""
         if rendered.strip():
-            text = rendered
-    if not text.strip():
-        raise RuntimeUnavailable("OpenHands conversation produced no assistant message")
-    return text
+            message_text = rendered
+
+    for candidate in (action_text, message_text):
+        if candidate.strip():
+            return candidate
+    raise RuntimeUnavailable(
+        "OpenHands conversation produced no assistant answer: no "
+        f"{FINISH_TOOL} call and no agent message in {len(events)} events"
+    )
 
 
 class OpenHandsRuntime:
@@ -216,7 +314,11 @@ class OpenHandsRuntime:
         key, _value = _credentials()
         if not key:
             return False, f"openhands present ({backend.label}) but no model credentials; set one of {LLM_ENV_KEYS}"
-        return True, f"openhands {backend.label} with credentials from {key}, read-only tools {READ_ONLY_TOOLS}"
+        detail = f"openhands {backend.label} with credentials from {key}, model {self.model!r}, read-only tools {READ_ONLY_TOOLS}"
+        warning = credential_mismatch(key, self.model)
+        if warning:
+            detail = f"{detail} -- WARNING: {warning}"
+        return True, detail
 
     # ------------------------------------------------------------------- run
     def run(self, ctx: AnalysisContext) -> RuntimeResult:
@@ -274,7 +376,7 @@ def _parse_report(reply: str, ctx: AnalysisContext) -> RcaReport:
     report.sha_short = ctx.sha[:9]
     report.role = "root-cause-analyzer"
     report.commit = ctx.commit
-    report.repamap = ctx.repomap.as_dict()
+    report.repomap = ctx.repomap.as_dict()
     report.training = ctx.training.as_dict()
     if not report.symptom:
         report.symptom = ctx.evidence.exception or "failure reported in the supplied evidence"

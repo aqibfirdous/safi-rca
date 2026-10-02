@@ -188,13 +188,25 @@ tests/                                 acceptance suite
   live in one environment. `test_openai_shim_keeps_the_real_aider_repomap_working`
   guards this.
 - The OpenHands runtime needs `openhands-sdk` plus model credentials
-  (`LLM_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, or
-  `SAFI_RCA_LLM_API_KEY`) and an optional `LLM_MODEL` / `SAFI_RCA_LLM_MODEL`.
+  (`LLM_API_KEY`, `LITELLM_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+  `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `SAFI_RCA_LLM_API_KEY`) and an
+  optional `LLM_MODEL` / `SAFI_RCA_LLM_MODEL`. The model name must carry the
+  provider prefix LiteLLM routes on — `gemini/gemini-3-flash-preview`,
+  `anthropic/claude-sonnet-4-5`, `openrouter/anthropic/claude-sonnet-4.5`.
   `openhands-sdk` installs cleanly on CPython 3.14 (the older `openhands-ai`
-  package does not). In this environment it is installed and the adapter resolves
-  the real `openhands.sdk` backend, builds a real read-only `Agent`, and refuses to
-  run because no model credentials are set. **The model call itself has therefore
-  not been exercised here** — `--runtime openhands` needs a key.
+  package does not). **The model call has been exercised live** against
+  `gemini/gemini-3-flash-preview`: the adapter builds a read-only `Agent`, the run
+  returns a correct report for the fixture's deliberate defect, and
+  `read_only.clean` is `true` with no files changed. A credential whose provider
+  disagrees with the model prefix is reported by `safi-rca runtimes` instead of
+  failing later as an opaque auth error.
+- Two quirks of the SDK shape the adapter, and both are regression-tested:
+  - An agent answers either by calling the `finish` tool (the text is on the
+    action, whose observation is deliberately empty) or as plain assistant text.
+    Both shapes are read, or a correct run is reported as a failed one.
+  - Granting tools via `tools=` duplicates the SDK's own defaults. The agent is
+    built with `tools=[]` and the effective set is asserted to be exactly
+    `ThinkTool` and `FinishTool`.
 - `openhands.sdk` prints an ASCII banner on import. The adapter sets
   `OPENHANDS_SUPPRESS_BANNER=1` before importing so `--json` and `safi-rca runtimes`
   stay machine-parseable.

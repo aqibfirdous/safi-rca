@@ -12,6 +12,8 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,8 @@ from conftest import (
     SAMPLE_REPO,
 )
 from safi_rca import gitutil
+from safi_rca.api import temp_root
+from safi_rca.runtime.openhands_runtime import LLM_ENV_KEYS
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -247,7 +251,6 @@ def test_openai_shim_keeps_the_real_aider_repomap_working():
     import tempfile
 
     from safi_rca.api import temp_root
-    from safi_rca import gitutil
 
     out = Path(tempfile.mkdtemp(prefix="aider-shim-", dir=temp_root(SAMPLE_REPO)))
     gitutil.export_commit(SAMPLE_REPO, SAMPLE_BROKEN_SHA, out)
@@ -263,6 +266,7 @@ def test_openhands_agent_is_granted_no_mutating_tools():
         READ_ONLY_TOOLS,
         _resolve_backend,
         build_read_only_agent,
+        granted_tool_names,
     )
     from safi_rca.errors import RuntimeUnavailable
 
@@ -272,13 +276,152 @@ def test_openhands_agent_is_granted_no_mutating_tools():
         pytest.skip(f"openhands not installed: {exc}")
 
     agent = build_read_only_agent(backend, "anthropic/claude-sonnet-4-5", "sk-not-a-real-key")
-    granted = [getattr(tool, "name", str(tool)) for tool in (agent.tools or [])]
-    assert granted == list(READ_ONLY_TOOLS)
+
+    # `tools=[]` plus the SDK defaults is what keeps each tool exactly once; the
+    # effective set, not `agent.tools`, is what the model may actually call.
+    granted = granted_tool_names(agent)
+    assert granted == set(READ_ONLY_TOOLS)
+    assert [getattr(tool, "name", str(tool)) for tool in (agent.tools or [])] == []
 
     mutating = ("bash", "exec", "write", "edit", "terminal", "str_replace", "patch", "file")
     for name in granted:
         lowered = name.lower()
         assert not any(bad in lowered for bad in mutating), f"mutating tool granted: {name}"
+
+
+def test_openhands_reply_is_read_from_either_answer_shape():
+    """The agent's answer arrives via `finish` *or* as plain assistant text.
+
+    Which one a model emits is its own choice -- observed both ways against a
+    live model -- so the extractor has to handle each.  Missing either shape
+    turns a successful, correctly-reasoned run into a spurious
+    ``RuntimeUnavailable``.
+    """
+    from openhands.sdk.event import ActionEvent, MessageEvent
+    from openhands.sdk.llm import Message, MessageToolCall, TextContent
+    from openhands.sdk.tool.builtins.finish import FinishAction
+
+    from safi_rca.errors import RuntimeUnavailable
+    from safi_rca.runtime.openhands_runtime import _final_agent_text
+
+    answer = '{"root_cause": "fallback missing"}'
+
+    class FakeState:
+        def __init__(self, events):
+            self.events = events
+
+    class FakeConversation:
+        def __init__(self, events):
+            self.state = FakeState(events)
+
+    # Shape 1: a plain agent message, with no `finish` call at all.
+    as_message = MessageEvent(
+        source="agent",
+        llm_message=Message(role="assistant", content=[TextContent(text=answer)]),
+    )
+    assert _final_agent_text(FakeConversation([as_message])) == answer
+
+    # Shape 2: the `finish` tool call, whose action carries the message and
+    # deliberately renders an empty observation.
+    finish_action = ActionEvent(
+        source="agent",
+        tool_name="FinishTool",
+        action=FinishAction(message=answer),
+        thought=[TextContent(text="the analysis is complete")],
+        tool_call_id="call-1",
+        tool_call=MessageToolCall(
+            id="call-1",
+            name="finish",
+            arguments=json.dumps({"message": answer}),
+            origin="completion",
+        ),
+        llm_response_id="resp-1",
+    )
+    assert _final_agent_text(FakeConversation([finish_action])) == answer
+
+    # A user message is never mistaken for the answer, and an agent that said
+    # nothing is reported rather than silently yielding an empty report.
+    user_event = MessageEvent(
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text="do the RCA")]),
+    )
+    with pytest.raises(RuntimeUnavailable):
+        _final_agent_text(FakeConversation([user_event]))
+
+
+def test_parsed_report_carries_real_provenance(broken_report):
+    """A parsed model reply must keep the repo-map and training provenance.
+
+    ``RcaReport`` defaults these to ``{}``, so a mistyped field name on the
+    report we build from the model's JSON silently drops the evidence that a
+    RepoMap was used at all -- the run still looks successful.  Assert the
+    provenance is carried, not just that the call returns something.
+    """
+    from safi_rca.context import build_context
+    from safi_rca.runtime.openhands_runtime import _parse_report
+
+    with _exported_tree(SAMPLE_REPO, SAMPLE_BROKEN_SHA) as export:
+        ctx = build_context(SAMPLE_REPO, SAMPLE_BROKEN_SHA, EVIDENCE_DIR / "pytest_failure.txt", export)
+
+    reply = json.dumps(
+        {
+            "symptom": "TypeError",
+            "root_cause": "missing DEFAULT_PLAN fallback in _lookup_plan",
+            "affected_component": "src/payment/validator.py",
+            "confidence": "High",
+            "uncertainty": "None",
+        }
+    )
+    report = _parse_report(reply, ctx)
+
+    assert report.repomap, "repo-map provenance was dropped"
+    assert report.repomap["producer"], "repo-map must name the producer that ran"
+    assert report.repomap["files_mapped"] > 0, "repo-map must actually map files"
+    assert report.repomap["non_empty"] is True
+    assert report.training, "training provenance was dropped"
+    assert report.sha == SAMPLE_BROKEN_SHA
+    assert report.repo == "sample-repo"
+
+
+@contextmanager
+def _exported_tree(repo: Path, sha: str):
+    """Export `sha` to a scratch dir, with no checkout of the user's repo."""
+
+    with tempfile.TemporaryDirectory(dir=temp_root(repo)) as tmp:
+        export = Path(tmp) / "export"
+        gitutil.export_commit(repo, sha, export)
+        yield export
+
+
+def test_gateway_credentials_route_to_the_right_provider(monkeypatch):
+    """OpenRouter and friends: the key and the model prefix must agree.
+
+    Sending an OpenRouter key to a model named ``anthropic/...`` fails deep
+    inside litellm with an opaque auth error, so the mismatch is caught before
+    the run and reported by ``runtimes``.
+    """
+    from safi_rca.runtime.openhands_runtime import credential_mismatch
+
+    for key in LLM_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    assert "OPENROUTER_API_KEY" in LLM_ENV_KEYS, "OpenRouter is a supported credential"
+
+    assert credential_mismatch("OPENROUTER_API_KEY", "openrouter/anthropic/claude-sonnet-4.5") is None
+    caught = credential_mismatch("OPENROUTER_API_KEY", "anthropic/claude-sonnet-4-5")
+    assert caught and "openrouter/" in caught, "an OpenRouter key with a non-OpenRouter model must be flagged"
+
+    # The same applies to every provider, and the message must name the provider
+    # actually expected -- not just say "OpenRouter" for any key.
+    gemini = credential_mismatch("GEMINI_API_KEY", "anthropic/claude-sonnet-4-5")
+    assert gemini and "gemini/" in gemini and "openrouter" not in gemini.lower()
+    assert credential_mismatch("GEMINI_API_KEY", "gemini/gemini-3-flash-preview") is None
+
+    # A model that names no provider at all is the default and is not flagged,
+    # because the operator may be pointing at a proxy.
+    assert credential_mismatch("ANTHROPIC_API_KEY", "anthropic/claude-sonnet-4-5") is None
+    assert credential_mismatch("LLM_API_KEY", "anything/at-all") is None
 
 
 # --- helpers -----------------------------------------------------------------

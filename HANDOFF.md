@@ -1,7 +1,7 @@
 # Handoff — end of session
 
 Everything below is committed. `git status` is clean, both fixture repositories are
-clean, and `python -m pytest` passes 15/15 from a cold start.
+clean, and `python -m pytest` passes 18/18 from a cold start.
 
 ## State: feature complete against the frozen design
 
@@ -58,21 +58,61 @@ Aider reads `openai.api_base` at module import (`aider/models/model.py:22`), so
 Aider is imported — same pattern as the existing `tree_sitter_compat.py`. Guarded by
 `test_openai_shim_keeps_the_real_aider_repomap_working`.
 
-### What is still not proven
+### The live model call now runs
 
-**The model call itself has not run.** No API key is available in this environment.
-Everything up to and including agent construction is verified; the LLM round trip and
-JSON parsing of the reply are not. To close it:
+**The model call itself has been exercised.** Verified against
+`gemini/gemini-3-flash-preview`:
 
-```bat
-set ANTHROPIC_API_KEY=sk-...
+```
+set OPENHANDS_SUPPRESS_BANNER=1
+set GEMINI_API_KEY=<key>
+set LLM_MODEL=gemini/gemini-3-flash-preview
 python -m safi_rca analyze --repo fixtures\sample-repo ^
     --sha 467b3d80a3a2c7bd0cecd81e44838bb3ff5fdc0c ^
     --evidence evidence\pytest_failure.txt --runtime openhands
 ```
 
-Also still unproven: that an agent runtime behaves read-only in practice. The tool
-wiring makes mutation impossible, but that has not been observed on a live run.
+It returns the correct root cause (`PaymentValidator._lookup_plan` returns `None`
+for the unmapped `gold` tier because the `DEFAULT_PLAN` fallback required by
+marker `PLAN-RESOLUTION-1847` is missing), cites the real failing test and the
+real code sites with line numbers, and reports `read_only.clean: true` with
+`files_changed: []`. `repomap.producer` is `aider 0.16.0`, 11/11 files mapped.
+
+Note the credential is required per-run in the environment and must never be
+written to a file, a fixture, or a commit.
+
+### Four bugs the live run exposed, all now fixed and regression-tested
+
+These did not surface in tests, because tests used fakes and a live run does not.
+
+1. **Duplicate tools crashed agent construction.** Passing the read-only tools via
+   `tools=` *duplicates* the ones `create_agent()` already injects as defaults, so
+   the SDK raised `Duplicate tool names found: {'finish', 'think'}`. The agent is
+   now built with `tools=[]` and the effective set — explicit specs plus
+   `include_default_tools` — is asserted to be exactly `ThinkTool` and
+   `FinishTool`, so a future SDK default that can write fails loudly.
+2. **The agent answers in two different shapes.** Sometimes it calls the `finish`
+   tool, in which case the text is on the *action* and the observation is
+   deliberately empty; sometimes it just returns assistant text. The extractor
+   only handled one, so correct runs were reported as
+   `RuntimeUnavailable: no assistant message`. Both are read now.
+3. **`content_to_str` returns `list[str]`.** It is a display helper, not an
+   extractor, and it substitutes `[Image: N URLs]` for image parts. Reading
+   `TextContent.text` directly is both correct and keeps a placeholder out of a
+   report we are about to parse as JSON.
+4. **`report.repamap` was a typo for `report.repomap`.** `RcaReport` defaults that
+   field to `{}`, so the mistyped assignment created a stray attribute and the
+   report shipped with *no repo-map provenance at all* while still looking
+   successful. `test_parsed_report_carries_real_provenance` now asserts the
+   producer is named and files were actually mapped.
+
+### OpenRouter
+
+`OPENROUTER_API_KEY` is now a supported credential and the model is routed by the
+prefix LiteLLM uses (`openrouter/anthropic/claude-sonnet-4.5`). A credential whose
+provider disagrees with the model prefix is reported by `safi-rca runtimes` rather
+than failing later as an opaque auth error inside LiteLLM. Verified at
+construction level; no live OpenRouter call was made.
 
 ## Pinned shas — do not rewrite these fixtures without updating the tests
 
@@ -111,15 +151,20 @@ suite loudly instead of silently testing something else. Training markers:
 1. The two-level analysis (one hop from the failing test, then the producing function)
    is tuned for the demo fixtures. Deeper call chains fall back to
    `deepest-failing-frame`, which is honest but less precise.
-2. `read_only.clean` proves *safi-rca* changed nothing. It does not prove an agent
-   runtime would behave — that needs a live OpenHands run.
+2. `read_only.clean` proves nothing was changed during the run. Combined with the
+   tool allowlist this is now backed by a live OpenHands run, but it is a
+   before/after fingerprint, not a syscall-level sandbox.
+3. The OpenHands system prompt is the SDK's default, which describes an agent that
+   may execute commands and edit code. No such tool is granted, and the RCA
+   instruction is appended to the user prompt, so the conflict is currently
+   neutralised by the allowlist rather than by the prompt itself.
 
 ## If continuing tomorrow
 
-1. Supply a model credential and run the five scenarios through
-   `--runtime openhands`. This is the last open item on Definition of Done #1.
-2. Add a test that feeds a recorded model reply through `_parse_report`, so the JSON
-   contract is covered even without a live key.
+1. Run the remaining four demo scenarios through `--runtime openhands`; only the
+   deliberately-broken `sample-repo` sha has been exercised live.
+2. Override the OpenHands system prompt via `AgentContext.system_message_suffix`
+   instead of relying on the tool allowlist to neutralise it.
 3. Widen the one-hop resolution into a bounded call-graph walk so deeper defects get a
    named component instead of `deepest-failing-frame`.
 4. Add detectors for failure classes the fixtures do not cover (exception swallowing,
