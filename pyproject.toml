@@ -16,9 +16,14 @@ dependencies = []
 #   repomap  -> Aider's RepoMap (tiered map of the exported tree)
 #   agent    -> the OpenHands agent runtime
 # Both degrade gracefully when absent: the report says which producer ran.
+#
+# Note: aider-chat 0.16 pins openai==0.27.6 while openhands-sdk needs
+# openai>=2.20, so pip reports a conflict.  Both still work -- safi_rca's
+# openai_compat shim restores the one module attribute Aider's RepoMap needs.
+# See README "Environment notes".
 [project.optional-dependencies]
 repomap = ["aider-chat>=0.16,<0.17"]
-agent = ["openhands-ai"]
+agent = ["openhands-sdk>=1.50"]
 test = ["pytest>=8"]
 
 [project.scripts]

@@ -227,6 +227,60 @@ def test_openhands_runtime_is_declared_even_when_unavailable():
         assert runtimes["openhands"]["reason"], "an unavailable runtime must explain itself"
 
 
+def test_openai_shim_keeps_the_real_aider_repomap_working():
+    """openhands-sdk requires openai>=2.20; aider 0.16 reads openai.api_base.
+
+    The two cannot be resolved into one dependency set, so the shim is what lets
+    the Aider RepoMap (acceptance test 2) keep working next to the agent runtime.
+    """
+    from safi_rca import openai_compat
+
+    assert openai_compat.install() is True
+    import openai
+
+    assert isinstance(openai.api_base, str), "aider dereferences openai.api_base at import time"
+    assert "openrouter.ai" not in openai.api_base, "must not masquerade as an openrouter endpoint"
+
+    # And the import aider actually performs at module load must still work.
+    from safi_rca.repomap import build_with_aider
+
+    import tempfile
+
+    from safi_rca.api import temp_root
+    from safi_rca import gitutil
+
+    out = Path(tempfile.mkdtemp(prefix="aider-shim-", dir=temp_root(SAMPLE_REPO)))
+    gitutil.export_commit(SAMPLE_REPO, SAMPLE_BROKEN_SHA, out)
+    result = build_with_aider(out, gitutil.list_files(SAMPLE_REPO, SAMPLE_BROKEN_SHA), 4096)
+    assert result.error is None
+    assert result.non_empty
+    assert "aider" in result.source.lower()
+
+
+def test_openhands_agent_is_granted_no_mutating_tools():
+    """The RCA agent must be structurally unable to write to the analysed tree."""
+    from safi_rca.runtime.openhands_runtime import (
+        READ_ONLY_TOOLS,
+        _resolve_backend,
+        build_read_only_agent,
+    )
+    from safi_rca.errors import RuntimeUnavailable
+
+    try:
+        backend = _resolve_backend()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"openhands not installed: {exc}")
+
+    agent = build_read_only_agent(backend, "anthropic/claude-sonnet-4-5", "sk-not-a-real-key")
+    granted = [getattr(tool, "name", str(tool)) for tool in (agent.tools or [])]
+    assert granted == list(READ_ONLY_TOOLS)
+
+    mutating = ("bash", "exec", "write", "edit", "terminal", "str_replace", "patch", "file")
+    for name in granted:
+        lowered = name.lower()
+        assert not any(bad in lowered for bad in mutating), f"mutating tool granted: {name}"
+
+
 # --- helpers -----------------------------------------------------------------
 
 _SOURCE_CACHE: dict[tuple[str, str], Path | None] = {}

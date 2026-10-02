@@ -72,9 +72,10 @@ def _aider_version() -> str:
 
 
 def build_with_aider(export_root: Path, files: list[str], map_tokens: int) -> RepoMapResult:
-    from . import tree_sitter_compat  # noqa: PLC0415
+    from . import openai_compat, tree_sitter_compat  # noqa: PLC0415
 
     tree_sitter_compat.install()
+    openai_compat.install()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         from aider.io import InputOutput  # noqa: PLC0415

@@ -29,11 +29,22 @@ The two integrations are honest about themselves: the JSON report always names t
 RepoMap producer that ran and the runtime that ran, and an unavailable runtime
 states why.
 
+## Read-only by construction
+
+The agent is granted exactly two OpenHands tools, `ThinkTool` and `FinishTool`.
+Neither writes a file, and the SDK ships no shell or file-write tool, so the agent
+has no way to mutate the analysed tree even if it were instructed to. Read-only is
+a property of the wiring, not a promise in the prompt.
+
+No browsing tools are needed either: safi-rca has already assembled the RepoMap,
+the source slices the evidence points at, and both training documents into the
+prompt before the agent starts.
+
 ## Requirements
 
 - Python >= 3.11 (developed and verified on 3.14)
 - `git` on `PATH` (2.55 used here)
-- Optional: `aider-chat` for the real Aider RepoMap, `openhands-ai` for the agent runtime
+- Optional: `aider-chat` for the real Aider RepoMap, `openhands-sdk` for the agent runtime
 
 ```bat
 pip install -e .                    :: core (standard library only)
@@ -148,6 +159,7 @@ safi_rca/            package
   training.py        repository + role training loading, selection, marker extraction
   repomap.py         Aider RepoMap with AST fallback
   tree_sitter_compat.py  shim for Aider 0.16 on tree-sitter >= 0.25
+  openai_compat.py   shim for Aider 0.16 on openai >= 1.0
   evidence.py        failure evidence parser
   symbols.py         AST symbol table, call graph, nullability, arithmetic, indexing
   analyst.py         detectors, site resolution, symptom/cause separation
@@ -168,8 +180,21 @@ tests/                                 acceptance suite
 - `aider-chat==0.16.0` pins `numpy==1.24.3`, which has no wheel for CPython 3.14. On
   3.14, install Aider with `--no-deps` (plus its pure-Python requirements) or use an
   older interpreter; the RepoMap itself needs only `aider` and tree-sitter.
-- The OpenHands runtime requires the `openhands-ai` package and model credentials
-  (`LLM_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `SAFI_RCA_LLM_API_KEY`).
-  In this environment OpenHands cannot be installed, so `safi-rca runtimes` reports it
-  as unavailable and `--runtime auto` uses the local deterministic engine. The adapter
-  is implemented and guarded; it has not been exercised against a live model.
+- Aider and the agent runtime pull opposite versions of `openai`: `aider-chat` pins
+  `openai==0.27.6`, `openhands-sdk` requires `openai>=2.20`. pip reports this as a
+  conflict, and on openai 2.x `import aider.repomap` raises `AttributeError:
+  module 'openai' has no attribute 'api_base'` — Aider reads that module attribute at
+  import time. `openai_compat.py` restores it, which is what lets both integrations
+  live in one environment. `test_openai_shim_keeps_the_real_aider_repomap_working`
+  guards this.
+- The OpenHands runtime needs `openhands-sdk` plus model credentials
+  (`LLM_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, or
+  `SAFI_RCA_LLM_API_KEY`) and an optional `LLM_MODEL` / `SAFI_RCA_LLM_MODEL`.
+  `openhands-sdk` installs cleanly on CPython 3.14 (the older `openhands-ai`
+  package does not). In this environment it is installed and the adapter resolves
+  the real `openhands.sdk` backend, builds a real read-only `Agent`, and refuses to
+  run because no model credentials are set. **The model call itself has therefore
+  not been exercised here** — `--runtime openhands` needs a key.
+- `openhands.sdk` prints an ASCII banner on import. The adapter sets
+  `OPENHANDS_SUPPRESS_BANNER=1` before importing so `--json` and `safi-rca runtimes`
+  stay machine-parseable.
