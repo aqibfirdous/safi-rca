@@ -101,6 +101,30 @@ def test_the_opt_out_prevents_reading_a_real_credential(monkeypatch, tmp_path):
     assert "GEMINI_API_KEY" not in os.environ
 
 
+def test_scratch_path_survives_cmd_exe_trailing_spaces(monkeypatch, tmp_path):
+    """`set VAR=value && cmd` leaves a trailing space in the value on cmd.exe.
+
+    That produced paths like ``B:\\repo\\.tmp \\safi-rca-x``, which fail deep
+    inside tempfile with a bare WinError 3 and no hint of the cause.
+    """
+
+    from safi_rca.api import temp_root
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    scratch = tmp_path / "scratch dir with spaces"
+
+    monkeypatch.setenv("SAFI_RCA_TMP_DIR", str(scratch) + " ")
+    root = temp_root(repo)
+    assert root.is_dir()
+    assert root == scratch.resolve()
+    assert " " not in root.name.strip() or root.name == scratch.name
+
+    # Quoted values and stray quotes are also tolerated.
+    monkeypatch.setenv("SAFI_RCA_TMP_DIR", f'"{scratch}" ')
+    assert temp_root(repo) == scratch.resolve()
+
+
 def test_redact_never_shows_the_secret():
     """A synthetic key, deliberately: a real one here would trip push protection."""
 

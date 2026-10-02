@@ -23,13 +23,20 @@ def temp_root(repo_path: Path) -> Path:
     analysis never spills onto another volume.  ``SAFI_RCA_TMP_DIR`` overrides
     the location entirely.
     """
-    override = os.environ.get("SAFI_RCA_TMP_DIR")
+    override = os.environ.get("SAFI_RCA_TMP_DIR", "")
+    # cmd.exe bakes a trailing space into `set VAR=value && cmd`, and that
+    # produces a path like "B:\repo\.tmp \safi-rca-x" which fails deep inside
+    # tempfile with a bare WinError 3.  Strip defensively: a scratch path is
+    # never valid with surrounding whitespace.
+    override = override.strip().strip('"')
     if override:
         root = Path(override).expanduser()
     else:
         root = gitutil.scratch_root(repo_path)
     root.mkdir(parents=True, exist_ok=True)
-    return root
+    if not root.is_dir():
+        raise FileNotFoundError(f"scratch directory is not usable: {root}")
+    return root.resolve()
 
 
 def analyze(
