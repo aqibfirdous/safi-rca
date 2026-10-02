@@ -20,6 +20,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # Keep every temporary artefact (git archive exports) on the project drive.
 os.environ.setdefault("SAFI_RCA_TMP_DIR", str(PROJECT_ROOT / ".tmp"))
 
+# Never read a developer's real credential during a test run: a live model call
+# from the suite would be slow, billable, and non-deterministic.
+os.environ["SAFI_RCA_NO_DOTENV"] = "1"
+
 # The scenarios are one shared definition, read by this suite and by the
 # dashboard.  A UI that drifted from the suite would claim coverage the suite
 # does not provide, so there is a single list.

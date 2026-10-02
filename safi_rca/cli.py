@@ -85,6 +85,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .dotenv import load_dotenv  # noqa: PLC0415 - optional, and must not mask real env
+
+    load_dotenv()
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")

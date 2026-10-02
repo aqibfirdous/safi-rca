@@ -141,6 +141,9 @@ def _resolve_backend() -> _Backend:
 
 
 def _credentials() -> tuple[str, str]:
+    from ..dotenv import load_dotenv  # noqa: PLC0415 - optional, and never overrides a real env var
+
+    load_dotenv()
     for key in LLM_ENV_KEYS:
         value = os.environ.get(key)
         if value:

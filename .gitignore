@@ -6,6 +6,11 @@ build/
 dist/
 *.egg-info/
 
+# secrets -- never commit credentials
+.env
+.env.*
+!.env.example
+
 # safi-rca scratch space (git archive exports of analysed commits)
 .tmp/
 safi-rca-tmp/
