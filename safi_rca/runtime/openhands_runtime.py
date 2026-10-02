@@ -178,6 +178,50 @@ def credential_mismatch(key: str, model: str) -> str | None:
     )
 
 
+#: Longest litellm will wait between retries of a failed model call.  The SDK
+#: exposes the backoff bounds but not the retry count, which lives in litellm
+#: itself.  Left at the default, a hard quota rejection burns ~90s of backoff
+#: before surfacing an error the operator cannot act on.  Bounded low, the run
+#: fails fast with a readable reason and the user can switch model or wait.
+RETRY_MAX_WAIT_SECONDS = 8.0
+
+#: A daily free-tier quota rejection, e.g.
+#: "Quota exceeded for metric: ...generate_content_free_tier_requests, limit: 20"
+_QUOTA_MARKERS = ("quota exceeded", "resource_exhausted", "resourceresourcesexhausted")
+_RETRY_HINT = re.compile(r"Please retry in ([0-9hmsd.]+)", re.IGNORECASE)
+
+
+def quota_exhausted(exc: BaseException) -> bool:
+    """True when the provider refused the call because a quota is spent.
+
+    A spent quota is not a transient fault: retrying cannot help until the
+    window resets, which may be hours away.
+    """
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "ratelimit" in text or "429" in text:
+        return True
+    return any(marker in text for marker in _QUOTA_MARKERS)
+
+
+def quota_message(exc: BaseException) -> str:
+    """A short, actionable description of a quota rejection."""
+
+    text = f"{type(exc).__name__}: {exc}"
+    hint = _RETRY_HINT.search(text)
+    when = f" Quota resets in about {hint.group(1)}." if hint else ""
+    model = ""
+    match = re.search(r"model: ([A-Za-z0-9._-]+)", text)
+    if match:
+        model = f" on model {match.group(1)}"
+    return (
+        f"model provider quota exhausted{model}.{when} "
+        f"Free-tier keys allow a small number of requests per day; switch "
+        f"LLM_MODEL, use a paid key, or run the 'local' runtime which needs no "
+        f"quota."
+    )
+
+
 def granted_tool_names(agent) -> set[str]:
     """Every tool the agent can actually call, explicit specs plus defaults."""
     explicit = {getattr(spec, "name", str(spec)) for spec in (agent.tools or [])}
@@ -199,7 +243,11 @@ def build_read_only_agent(backend: _Backend, model: str, api_key: str):
     """
 
     settings = backend.settings_cls(
-        llm=backend.llm_cls(model=model, api_key=api_key),
+        llm=backend.llm_cls(
+            model=model,
+            api_key=api_key,
+            retry_max_wait=RETRY_MAX_WAIT_SECONDS,
+        ),
         tools=[],
         enable_switch_llm_tool=False,
     )
@@ -250,13 +298,12 @@ def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str)
         delete_on_close=False,
     )
     try:
-        conversation.send_message(prompt)
-        conversation.run()
+        _guarded_run(conversation, prompt)
         reply = _final_agent_text(conversation)
         if _looks_like_report(reply):
             return reply
         conversation.send_message(RETRY_INSTRUCTION)
-        conversation.run()
+        _guarded_run(conversation, RETRY_INSTRUCTION)
         return _final_agent_text(conversation)
     finally:
         close = getattr(conversation, "close", None)
@@ -265,6 +312,24 @@ def run_conversation(backend: _Backend, agent, workspace_dir: Path, prompt: str)
                 close()
             except Exception:  # noqa: BLE001 - teardown must not mask the result
                 pass
+
+
+def _guarded_run(conversation, message: str) -> None:
+    """Send and run, turning a spent quota into an actionable message.
+
+    litellm retries a rejected call several times before the SDK surfaces it, and
+    the raw error is a long JSON blob naming an internal quota metric.  A quota
+    rejection cannot be fixed by retrying, so it is reported as a
+    :class:`RuntimeUnavailable` the operator can act on.
+    """
+
+    try:
+        conversation.send_message(message)
+        conversation.run()
+    except Exception as exc:  # noqa: BLE001 - re-raised below when actionable
+        if quota_exhausted(exc):
+            raise RuntimeUnavailable(quota_message(exc)) from exc
+        raise
 
 
 def _looks_like_report(reply: str) -> bool:

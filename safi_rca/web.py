@@ -349,6 +349,13 @@ def _runtimes_to_try() -> list[str]:
 _RUNTIME_NAME = {"local": "local-deterministic", "openhands": "openhands"}
 
 
+#: A client that hangs up mid-response.  These are not server faults: there is
+#: nobody left to send a page to, and reporting them as 500s produced a
+#: double-fault traceback (the error page write also raised) whenever a browser
+#: navigated away or reloaded during a long model call.
+_DISCONNECTS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "safi-rca"
     _results: dict = {}
@@ -356,6 +363,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args) -> None:  # keep the console clean
         pass
+
+    def handle(self) -> None:
+        """Serve requests, treating a vanished client as routine.
+
+        ``BaseHTTPRequestHandler.handle`` reads the request line and the
+        response body, so a client that disconnects can raise on either side.
+        Overriding this catches both, where catching inside ``do_GET`` only
+        covers the write.
+        """
+
+        try:
+            super().handle()
+        except _DISCONNECTS:
+            pass
 
     def _send(self, body: str, status: int = 200) -> None:
         payload = body.encode("utf-8")
@@ -366,25 +387,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_quietly(self, body: str, status: int = 200) -> None:
+        """Send a page, tolerating a client that already gave up."""
+
+        try:
+            self._send(body, status=status)
+        except _DISCONNECTS:
+            pass
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         parsed = urlparse(self.path)
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         try:
             if parsed.path in ("/", "/index.html"):
-                self._send(self._dashboard())
+                self._send_quietly(self._dashboard())
             elif parsed.path == "/scenario":
-                self._send(_scenario_html(query.get("s", "")))
+                self._send_quietly(_scenario_html(query.get("s", "")))
             elif parsed.path == "/run":
-                self._send(self._run(query))
+                self._send_quietly(self._run(query))
             elif parsed.path == "/health":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
             else:
-                self._send(_page("Not found", "<h1>404</h1><p><a href='/'>back</a></p>"), status=404)
+                self._send_quietly(
+                    _page("Not found", "<h1>404</h1><p><a href='/'>back</a></p>"),
+                    status=404,
+                )
+        except _DISCONNECTS:
+            # The browser closed the tab, reloaded, or hit its own timeout while
+            # a model call was in flight.  Expected during long runs.
+            pass
         except Exception as exc:  # noqa: BLE001 - a broken page must still be a page
-            self._send(_page("Error", f'<div class="err">{_esc(type(exc).__name__)}: {_esc(exc)}</div>'), status=500)
+            self._send_quietly(
+                _page("Error", f'<div class="err">{_esc(type(exc).__name__)}: {_esc(exc)}</div>'),
+                status=500,
+            )
 
     def _dashboard(self, error: str = "") -> str:
         with self._lock:
