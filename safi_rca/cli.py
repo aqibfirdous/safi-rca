@@ -38,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     info = sub.add_parser("runtimes", help="show which agent runtimes are usable")
     info.set_defaults(_info=True)
+
+    serve = sub.add_parser("serve", help="run the local dashboard (stdlib only, loopback by default)")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address; default is loopback only")
+    serve.add_argument("--port", type=int, default=8765, help="bind port")
+    serve.add_argument("--warm", action="store_true", help="pre-run scenarios so the first page is fast")
+    serve.set_defaults(_serve=True)
     return parser
 
 
@@ -72,6 +78,12 @@ def _cmd_runtimes(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .web import serve  # noqa: PLC0415 - optional surface, imported on demand
+
+    return serve(host=args.host, port=args.port, warm=args.warm)
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -81,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if getattr(args, "_serve", False):
+            return _cmd_serve(args)
         if getattr(args, "_info", False):
             return _cmd_runtimes(args)
         return _cmd_analyze(args)

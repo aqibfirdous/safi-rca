@@ -65,8 +65,23 @@ safi-rca analyze --repo fixtures\sample-repo ^
 
 safi-rca analyze --repo R --sha <40-hex> --evidence E --json --json-out report.json
 safi-rca runtimes
+safi-rca serve                       # local dashboard on http://127.0.0.1:8765
 python -m safi_rca --help
 ```
+
+### Dashboard
+
+`safi-rca serve` starts a stdlib-only dashboard (no new dependencies, loopback
+bind by default). It runs the acceptance scenarios through both runtimes and
+puts them side by side, because **the two runtimes fail differently**: where the
+evidence cannot be reproduced at the analysed sha, or names no code site, the
+deterministic engine says so and lowers its confidence, while a language model
+tends to invent a plausible cause and report High. That gap is the reason the
+comparison is on the front page.
+
+The scenario list lives in `safi_rca/scenarios.py` and is read by both the
+acceptance suite and the dashboard, so the scenarios the tests prove are exactly
+the scenarios the UI shows.
 
 | flag | meaning |
 | --- | --- |
